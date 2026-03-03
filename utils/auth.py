@@ -4,11 +4,12 @@
 """
 
 import json
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
+from playwright.async_api import async_playwright
 
 from utils.config import AccountConfig, ProviderConfig, parse_cookies
 
@@ -24,6 +25,7 @@ class AuthResult:
 
 	session: str
 	api_user: str
+	waf_cookies: dict
 	success: bool = True
 	error: str | None = None
 
@@ -67,69 +69,155 @@ def load_session_cache(username: str, provider: str) -> dict | None:
 		return None
 
 
-def login(username: str, password: str, provider_config: ProviderConfig) -> AuthResult:
-	"""通过用户名密码登录，获取 session 和 api_user"""
-	login_url = f'{provider_config.domain}{provider_config.login_api_path}'
-	print(f'[AUTH] Logging in as {username} to {provider_config.domain}...')
+async def login(username: str, password: str, provider_config: ProviderConfig) -> AuthResult:
+	"""使用 Playwright 通过用户名密码登录，获取 session、api_user 和 WAF cookies"""
+	login_api_url = f'{provider_config.domain}{provider_config.login_api_path}'
+	login_page_url = f'{provider_config.domain}{provider_config.login_path}'
+	print(f'[AUTH] Logging in as {username} to {provider_config.domain} (via Playwright)...')
 
 	try:
-		with httpx.Client(http2=True, timeout=30.0) as client:
-			response = client.post(
-				login_url,
-				json={'username': username, 'password': password},
-				headers={
-					'Content-Type': 'application/json',
-					'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				},
-			)
-
-			if response.status_code != 200:
-				return AuthResult(
-					session='', api_user='', success=False, error=f'Login failed: HTTP {response.status_code}'
+		async with async_playwright() as p:
+			with tempfile.TemporaryDirectory() as temp_dir:
+				context = await p.chromium.launch_persistent_context(
+					user_data_dir=temp_dir,
+					headless=False,
+					user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+					viewport={'width': 1920, 'height': 1080},
+					args=[
+						'--disable-blink-features=AutomationControlled',
+						'--disable-dev-shm-usage',
+						'--disable-web-security',
+						'--disable-features=VizDisplayCompositor',
+						'--no-sandbox',
+					],
 				)
 
-			data = response.json()
-			if not data.get('success'):
-				msg = data.get('message', 'Unknown error')
-				return AuthResult(session='', api_user='', success=False, error=f'Login failed: {msg}')
+				page = await context.new_page()
 
-			# 从响应数据中获取 api_user (data.id)
-			user_data = data.get('data', {})
-			api_user = str(user_data.get('id', ''))
-			if not api_user:
-				return AuthResult(
-					session='', api_user='', success=False, error='Login succeeded but no user ID in response'
-				)
+				try:
+					# 先访问登录页面过 WAF
+					print(f'[AUTH] {username}: Accessing login page to pass WAF...')
+					await page.goto(login_page_url, wait_until='networkidle')
 
-			# 从响应的 set-cookie 中获取 session
-			session_value = response.cookies.get('session')
-			if not session_value:
-				return AuthResult(
-					session='',
-					api_user='',
-					success=False,
-					error='Login succeeded but no session cookie in response',
-				)
+					try:
+						await page.wait_for_function('document.readyState === "complete"', timeout=5000)
+					except Exception:
+						await page.wait_for_timeout(3000)
 
-			print(f'[AUTH] Login successful for {username}, api_user={api_user}')
-			return AuthResult(session=session_value, api_user=api_user)
+					# 收集 WAF cookies
+					waf_cookies = {}
+					if provider_config.needs_waf_cookies() and provider_config.waf_cookie_names:
+						cookies = await page.context.cookies()
+						for cookie in cookies:
+							cookie_name = cookie.get('name')
+							cookie_value = cookie.get('value')
+							if cookie_name in provider_config.waf_cookie_names and cookie_value is not None:
+								waf_cookies[cookie_name] = cookie_value
+						print(f'[AUTH] {username}: Got {len(waf_cookies)} WAF cookies')
+
+					# 使用 Playwright 发送登录 API 请求
+					print(f'[AUTH] {username}: Sending login request...')
+					response = await page.request.post(
+						login_api_url,
+						data={'username': username, 'password': password},
+						headers={'Content-Type': 'application/json'},
+					)
+
+					status = response.status
+					if status != 200:
+						await context.close()
+						return AuthResult(
+							session='',
+							api_user='',
+							waf_cookies={},
+							success=False,
+							error=f'Login failed: HTTP {status}',
+						)
+
+					data = await response.json()
+					if not data.get('success'):
+						msg = data.get('message', 'Unknown error')
+						await context.close()
+						return AuthResult(
+							session='', api_user='', waf_cookies={}, success=False, error=f'Login failed: {msg}'
+						)
+
+					# 从响应数据中获取 api_user (data.id)
+					user_data = data.get('data', {})
+					api_user = str(user_data.get('id', ''))
+					if not api_user:
+						await context.close()
+						return AuthResult(
+							session='',
+							api_user='',
+							waf_cookies={},
+							success=False,
+							error='Login succeeded but no user ID in response',
+						)
+
+					# 从浏览器 cookies 中获取 session
+					all_cookies = await page.context.cookies()
+					session_value = None
+					for cookie in all_cookies:
+						if cookie.get('name') == 'session':
+							session_value = cookie.get('value')
+							break
+
+					if not session_value:
+						# 尝试从响应头获取
+						headers = response.headers
+						set_cookie = headers.get('set-cookie', '')
+						if 'session=' in set_cookie:
+							for part in set_cookie.split(';'):
+								part = part.strip()
+								if part.startswith('session='):
+									session_value = part.split('=', 1)[1]
+									break
+
+					if not session_value:
+						await context.close()
+						return AuthResult(
+							session='',
+							api_user='',
+							waf_cookies={},
+							success=False,
+							error='Login succeeded but no session cookie in response',
+						)
+
+					print(f'[AUTH] Login successful for {username}, api_user={api_user}')
+					await context.close()
+					return AuthResult(
+						session=session_value,
+						api_user=api_user,
+						waf_cookies=waf_cookies,
+					)
+
+				except Exception as e:
+					await context.close()
+					return AuthResult(
+						session='', api_user='', waf_cookies={}, success=False, error=f'Login error: {str(e)[:100]}'
+					)
 
 	except Exception as e:
-		return AuthResult(session='', api_user='', success=False, error=f'Login error: {str(e)[:100]}')
+		return AuthResult(
+			session='', api_user='', waf_cookies={}, success=False, error=f'Browser launch error: {str(e)[:100]}'
+		)
 
 
-def resolve_account_auth(account: AccountConfig, provider_config: ProviderConfig) -> tuple[dict, str] | None:
+async def resolve_account_auth(
+	account: AccountConfig, provider_config: ProviderConfig
+) -> tuple[dict, str, dict] | None:
 	"""解析账号的认证信息
 
-	- cookies 方式：直接返回 (cookies_dict, api_user)
-	- 用户名密码方式：先尝试缓存，再尝试登录
-	返回 None 表示认证失败
+	- cookies 方式：返回 (cookies_dict, api_user, {})
+	- 用户名密码方式：先尝试缓存，再尝试 Playwright 登录
+	返回 (user_cookies, api_user, waf_cookies) 或 None
 	"""
 	if not account.uses_credential_login():
 		cookies = parse_cookies(account.cookies)
 		if not cookies or not account.api_user:
 			return None
-		return (cookies, account.api_user)
+		return (cookies, account.api_user, {})
 
 	username = account.username
 	password = account.password
@@ -140,19 +228,19 @@ def resolve_account_auth(account: AccountConfig, provider_config: ProviderConfig
 	cached = load_session_cache(username, account.provider)
 	if cached:
 		print(f'[AUTH] Using cached session for {username}')
-		return ({'session': cached['session']}, cached['api_user'])
+		return ({'session': cached['session']}, cached['api_user'], {})
 
-	# 缓存不可用，执行登录
-	result = login(username, password, provider_config)
+	# 缓存不可用，执行 Playwright 登录
+	result = await login(username, password, provider_config)
 	if not result.success:
 		print(f'[AUTH] {result.error}')
 		return None
 
 	save_session_cache(username, account.provider, result.session, result.api_user)
-	return ({'session': result.session}, result.api_user)
+	return ({'session': result.session}, result.api_user, result.waf_cookies)
 
 
-def retry_with_relogin(account: AccountConfig, provider_config: ProviderConfig) -> tuple[dict, str] | None:
+async def retry_with_relogin(account: AccountConfig, provider_config: ProviderConfig) -> tuple[dict, str, dict] | None:
 	"""session 过期时强制重新登录，仅对用户名密码方式有效"""
 	if not account.uses_credential_login():
 		print('[AUTH] Session expired but account uses static cookies, cannot auto-relogin')
@@ -164,10 +252,10 @@ def retry_with_relogin(account: AccountConfig, provider_config: ProviderConfig) 
 		return None
 
 	print(f'[AUTH] Session expired for {username}, re-logging in...')
-	result = login(username, password, provider_config)
+	result = await login(username, password, provider_config)
 	if not result.success:
 		print(f'[AUTH] Re-login failed: {result.error}')
 		return None
 
 	save_session_cache(username, account.provider, result.session, result.api_user)
-	return ({'session': result.session}, result.api_user)
+	return ({'session': result.session}, result.api_user, result.waf_cookies)

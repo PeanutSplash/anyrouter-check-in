@@ -312,16 +312,22 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	print(f'[INFO] {account_name}: Using provider "{account.provider}" ({provider_config.domain})')
 
 	# 解析认证信息（支持 cookies 方式和用户名密码方式）
-	auth_result = resolve_account_auth(account, provider_config)
+	auth_result = await resolve_account_auth(account, provider_config)
 	if not auth_result:
 		print(f'[FAILED] {account_name}: Authentication failed')
 		return False, None, None
 
-	user_cookies, api_user = auth_result
+	user_cookies, api_user, login_waf_cookies = auth_result
 
-	all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
-	if not all_cookies:
-		return False, None, None
+	# 密码登录时 WAF cookies 已在登录过程中获取，无需重复获取
+	all_cookies: dict | None = None
+	if login_waf_cookies:
+		all_cookies = {**login_waf_cookies, **user_cookies}
+		print(f'[INFO] {account_name}: Using WAF cookies from login process')
+	else:
+		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
+		if not all_cookies:
+			return False, None, None
 
 	client = httpx.Client(http2=True, timeout=30.0)
 
@@ -345,18 +351,23 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 		user_info_before = get_user_info(client, headers, user_info_url)
 
-		# 检查是否 session 过期（401），尝试自动重新登录
-		if user_info_before and not user_info_before.get('success') and '401' in user_info_before.get('error', ''):
-			relogin_result = retry_with_relogin(account, provider_config)
-			if relogin_result:
-				new_cookies, new_api_user = relogin_result
-				all_cookies = await prepare_cookies(account_name, provider_config, new_cookies)
-				if all_cookies:
-					client.cookies.clear()
-					client.cookies.update(all_cookies)
-					headers[provider_config.api_user_key] = new_api_user
-					api_user = new_api_user
-					user_info_before = get_user_info(client, headers, user_info_url)
+		# 检查是否 session 过期（401/403），尝试自动重新登录
+		if user_info_before and not user_info_before.get('success'):
+			error_msg = user_info_before.get('error', '')
+			if '401' in error_msg or '403' in error_msg:
+				relogin_result = await retry_with_relogin(account, provider_config)
+				if relogin_result:
+					new_cookies, new_api_user, new_waf_cookies = relogin_result
+					if new_waf_cookies:
+						all_cookies = {**new_waf_cookies, **new_cookies}
+					else:
+						all_cookies = await prepare_cookies(account_name, provider_config, new_cookies)
+					if all_cookies:
+						client.cookies.clear()
+						client.cookies.update(all_cookies)
+						headers[provider_config.api_user_key] = new_api_user
+						api_user = new_api_user
+						user_info_before = get_user_info(client, headers, user_info_url)
 
 		if user_info_before and user_info_before.get('success'):
 			print(user_info_before['display'])
