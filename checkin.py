@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
@@ -246,6 +246,7 @@ def format_check_in_notification(detail: dict) -> str:
 def generate_ci_summary(
 	account_results: list[dict],
 	account_check_in_details: dict,
+	current_balances: dict,
 	success_count: int,
 	total_count: int,
 ):
@@ -260,7 +261,7 @@ def generate_ci_summary(
 	lines = [
 		f'## {status_icon} AnyRouter 签到结果 ({success_count}/{total_count})',
 		'',
-		f'> :alarm_clock: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+		f'> :alarm_clock: {datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")}',
 		'',
 		'| 账号 | 状态 | 余额 | 签到获得 | 余额变化 |',
 		'|------|------|------|----------|----------|',
@@ -282,6 +283,11 @@ def generate_ci_summary(
 				change = f'-${abs(change_val):.2f}'
 			else:
 				change = '-'
+		elif account_key in current_balances:
+			# 有签到后余额但没有前后对比数据
+			balance = f'${current_balances[account_key]["quota"]:.2f}'
+			reward = '-'
+			change = '-'
 		else:
 			balance = '-'
 			reward = '-'
@@ -395,7 +401,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 async def main():
 	"""主函数"""
 	print('[SYSTEM] AnyRouter.top multi-account auto check-in script started (using Playwright)')
-	print(f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
+	print(f'[TIME] Execution time: {datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")}')
 
 	app_config = AppConfig.load_from_env()
 	print(f'[INFO] Loaded {len(app_config.providers)} provider configuration(s)')
@@ -554,7 +560,7 @@ async def main():
 		else:
 			summary.append('[ERROR] All accounts check-in failed')
 
-		time_info = f'[TIME] Execution time: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+		time_info = f'[TIME] Execution time: {datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")}'
 
 		notify_content = '\n\n'.join([time_info, '\n'.join(notification_content), '\n'.join(summary)])
 
@@ -565,7 +571,7 @@ async def main():
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
 
 	# 生成 CI Summary
-	generate_ci_summary(account_results, account_check_in_details, success_count, total_count)
+	generate_ci_summary(account_results, account_check_in_details, current_balances, success_count, total_count)
 
 	# 设置退出码
 	sys.exit(0 if success_count > 0 else 1)
