@@ -374,7 +374,12 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		if user_info_before and user_info_before.get('success'):
 			print(user_info_before['display'])
 		elif user_info_before:
-			print(user_info_before.get('error', 'Unknown error'))
+			error_msg = user_info_before.get('error', 'Unknown error')
+			print(error_msg)
+			# 认证失败（401/403）且无法恢复，直接判定签到失败
+			if '401' in error_msg or '403' in error_msg:
+				print(f'[FAILED] {account_name}: Authentication failed, skipping check-in')
+				return False, None, None
 
 		if provider_config.needs_manual_check_in():
 			success = execute_check_in(client, account_name, provider_config, headers)
