@@ -21,6 +21,7 @@ from utils.notify import notify
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+SUMMARY_FILE = 'checkin_summary.md'
 
 
 def load_balance_hash():
@@ -242,6 +243,62 @@ def format_check_in_notification(detail: dict) -> str:
 	return '\n'.join(lines)
 
 
+def generate_ci_summary(
+	account_results: list[dict],
+	account_check_in_details: dict,
+	success_count: int,
+	total_count: int,
+):
+	"""生成 CI Job Summary（Markdown 格式）"""
+	if success_count == total_count:
+		status_icon = ':white_check_mark:'
+	elif success_count > 0:
+		status_icon = ':warning:'
+	else:
+		status_icon = ':x:'
+
+	lines = [
+		f'## {status_icon} AnyRouter 签到结果 ({success_count}/{total_count})',
+		'',
+		f'> :alarm_clock: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}',
+		'',
+		'| 账号 | 状态 | 余额 | 签到获得 | 余额变化 |',
+		'|------|------|------|----------|----------|',
+	]
+
+	for i, result in enumerate(account_results):
+		account_key = f'account_{i + 1}'
+		name = result['name']
+		status = ':white_check_mark: 成功' if result['success'] else ':x: 失败'
+
+		if account_key in account_check_in_details:
+			detail = account_check_in_details[account_key]
+			balance = f'${detail["after_quota"]:.2f}'
+			reward = f'+${detail["check_in_reward"]:.2f}' if detail['check_in_reward'] > 0 else '-'
+			change_val = detail['balance_change']
+			if change_val > 0:
+				change = f'+${change_val:.2f}'
+			elif change_val < 0:
+				change = f'-${abs(change_val):.2f}'
+			else:
+				change = '-'
+		else:
+			balance = '-'
+			reward = '-'
+			change = '-'
+
+		lines.append(f'| {name} | {status} | {balance} | {reward} | {change} |')
+
+	summary_md = '\n'.join(lines) + '\n'
+
+	try:
+		with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
+			f.write(summary_md)
+		print(f'[INFO] CI summary written to {SUMMARY_FILE}')
+	except Exception as e:
+		print(f'[WARN] Failed to write CI summary: {e}')
+
+
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
@@ -346,6 +403,7 @@ async def main():
 	notification_content = []
 	current_balances = {}
 	account_check_in_details = {}  # 存储每个账号的签到详情
+	account_results: list[dict] = []  # 记录每个账号的结果，用于生成 summary
 	need_notify = False  # 是否需要发送通知
 	balance_changed = False  # 余额是否有变化
 
@@ -355,6 +413,15 @@ async def main():
 			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
 			if success:
 				success_count += 1
+
+			# 记录账号结果
+			account_results.append(
+				{
+					'name': account.get_display_name(i),
+					'success': success,
+					'provider': account.provider,
+				}
+			)
 
 			should_notify_this_account = False
 
@@ -417,6 +484,14 @@ async def main():
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			need_notify = True  # 异常也需要通知
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+			account_results.append(
+				{
+					'name': account_name,
+					'success': False,
+					'provider': account.provider,
+					'error': str(e)[:50],
+				}
+			)
 
 	# 检查余额变化
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
@@ -477,6 +552,9 @@ async def main():
 		print('[NOTIFY] Notification sent due to failures or balance changes')
 	else:
 		print('[INFO] All accounts successful and no balance changes detected, notification skipped')
+
+	# 生成 CI Summary
+	generate_ci_summary(account_results, account_check_in_details, success_count, total_count)
 
 	# 设置退出码
 	sys.exit(0 if success_count > 0 else 1)

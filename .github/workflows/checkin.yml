@@ -104,5 +104,9 @@ jobs:
     - name: 执行结果
       if: always()
       run: |
-        echo "签到任务执行完成"
-        echo "时间: $(Get-Date)"
+        if (Test-Path checkin_summary.md) {
+          Get-Content checkin_summary.md -Raw | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          echo "✅ Summary written"
+        } else {
+          echo "⚠️ No summary file found"
+        }
